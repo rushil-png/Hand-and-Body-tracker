@@ -1,3 +1,4 @@
+import argparse
 import math
 import os
 import time
@@ -27,6 +28,9 @@ CONNECTIONS = [
     (13, 17), (17, 18), (18, 19), (19, 20),  # Pinky
     (0, 17),                                  # Palm base
 ]
+
+# Resolutions you can switch between while running (keys 1-4, or + / -)
+PRESETS = [(320, 240), (640, 480), (1280, 720), (1920, 1080)]
 
 # BGR colours per hand
 COLOURS = {"Left": (255, 120, 0), "Right": (0, 140, 255)}
@@ -77,8 +81,6 @@ def recognise_gesture(pts, up):
         return "Pointing"
     if i and m and not (r or p):
         return "Peace"
-    if i and p and not (m or r):
-        return "Rock On"
     if t and p and not (i or m or r):
         return "Call Me"
     if i and m and r and not (p or t):
@@ -88,7 +90,39 @@ def recognise_gesture(pts, up):
     return f"{count} Fingers"
 
 
+def open_camera(index, width, height):
+    """Open the webcam at (roughly) the requested size.
+
+    On Windows the default backend often fails or crashes when the size is changed on a
+    running camera, so we use DirectShow there and re-open the camera for every size change.
+    MJPG is requested because many webcams can only do 720p/1080p in that format.
+    """
+    if os.name == "nt":
+        cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
+    else:
+        cap = cv2.VideoCapture(index)
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    return cap, int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Hand tracker")
+    parser.add_argument("--res", default="640x480",
+                        help="starting camera resolution, e.g. 1280x720 (default 640x480)")
+    parser.add_argument("--camera", type=int, default=0, help="camera index (default 0)")
+    args = parser.parse_args()
+    try:
+        w, h = (int(v) for v in args.res.lower().split("x"))
+    except ValueError:
+        parser.error("--res must look like 1280x720")
+    return w, h, args.camera
+
+
 def main():
+    req_w, req_h, cam_index = parse_args()
+
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model not found at: {model_path}")
 
@@ -99,7 +133,14 @@ def main():
     )
     detector = mp.tasks.vision.HandLandmarker.create_from_options(options)
 
-    cap = cv2.VideoCapture(0)
+    cap, cur_w, cur_h = open_camera(cam_index, req_w, req_h)
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open camera {cam_index}")
+    failed_reads = 0
+
+    # Resizable window: you can also just drag its edges to change the display size
+    cv2.namedWindow("Hand Tracking", cv2.WINDOW_NORMAL)
+
     start = time.time()
     last_ts = -1
     history = {"Left": deque(maxlen=5), "Right": deque(maxlen=5)}  # smooths gesture flicker
@@ -107,13 +148,27 @@ def main():
 
     while cap.isOpened():
         ok, frame = cap.read()
-        if not ok:
-            break
+        if not ok or frame is None:
+            # A camera that is switching size can drop a few frames; only give up if it keeps failing
+            failed_reads += 1
+            if failed_reads > 30:
+                print("Camera stopped returning frames.")
+                break
+            cv2.waitKey(30)
+            continue
+        failed_reads = 0
 
         # Mirror the image like a selfie camera. MediaPipe's Left/Right labels
         # assume a mirrored image, so this also makes them correct.
         frame = cv2.flip(frame, 1)
         h, w, _ = frame.shape
+
+        # Scale lines and text with the image so they look the same at any resolution
+        sc = max(0.5, h / 720)
+        line_t = max(1, int(3 * sc))
+        dot_r = max(2, int(5 * sc))
+        font = 0.7 * sc
+        font_t = max(1, int(2 * sc))
 
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
@@ -141,18 +196,18 @@ def main():
             total += count
 
             for a, b in CONNECTIONS:
-                cv2.line(frame, pts[a], pts[b], colour, 3)
-            for name_idx, p in enumerate(pts):
-                cv2.circle(frame, p, 5, (0, 255, 0), -1)
+                cv2.line(frame, pts[a], pts[b], colour, line_t)
+            for p in pts:
+                cv2.circle(frame, p, dot_r, (0, 255, 0), -1)
 
             # Label above the hand
             x_min = min(p[0] for p in pts)
             y_min = min(p[1] for p in pts)
             label = f"{side} hand | {count} | {gesture}"
-            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
-            top = max(y_min - 15, th + 10)
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font, font_t)
+            top = max(y_min - int(15 * sc), th + int(10 * sc))
             cv2.rectangle(frame, (x_min - 5, top - th - 8), (x_min + tw + 5, top + 6), colour, -1)
-            cv2.putText(frame, label, (x_min, top), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            cv2.putText(frame, label, (x_min, top), cv2.FONT_HERSHEY_SIMPLEX, font, (255, 255, 255), font_t)
 
         # Forget gestures for hands that left the frame
         for side in history:
@@ -162,13 +217,44 @@ def main():
         now = time.time()
         fps = 1 / (now - prev_time) if now > prev_time else 0
         prev_time = now
-        cv2.putText(frame, f"Total fingers: {total}", (15, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (255, 255, 255), 4)
-        cv2.putText(frame, f"Total fingers: {total}", (15, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 0, 0), 2)
-        cv2.putText(frame, f"FPS: {fps:.0f}", (15, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+        big = 1.1 * sc
+        cv2.putText(frame, f"Total fingers: {total}", (15, int(40 * sc)),
+                    cv2.FONT_HERSHEY_SIMPLEX, big, (255, 255, 255), max(2, int(4 * sc)))
+        cv2.putText(frame, f"Total fingers: {total}", (15, int(40 * sc)),
+                    cv2.FONT_HERSHEY_SIMPLEX, big, (0, 0, 0), max(1, int(2 * sc)))
+        info = f"{w}x{h}  |  {fps:.0f} FPS  |  1-4 or +/- = resolution, ESC = quit"
+        cv2.putText(frame, info, (15, h - int(15 * sc)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6 * sc, (255, 255, 255), font_t)
 
         cv2.imshow("Hand Tracking", frame)
-        if cv2.waitKey(1) & 0xFF == 27:  # ESC to quit
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == 27:  # ESC
             break
+
+        new_res = None
+        if ord("1") <= key <= ord("4"):
+            new_res = PRESETS[key - ord("1")]
+        elif key in (ord("+"), ord("=")):
+            bigger = [r for r in PRESETS if r[0] > cur_w]
+            new_res = bigger[0] if bigger else None
+        elif key in (ord("-"), ord("_")):
+            smaller = [r for r in PRESETS if r[0] < cur_w]
+            new_res = smaller[-1] if smaller else None
+
+        if new_res and new_res != (cur_w, cur_h):
+            cap.release()
+            cap, cur_w, cur_h = open_camera(cam_index, *new_res)
+            if not cap.isOpened():
+                print("Could not reopen the camera; going back to the previous size.")
+                cap, cur_w, cur_h = open_camera(cam_index, req_w, req_h)
+            elif (cur_w, cur_h) != new_res:
+                print(f"Camera can't do {new_res[0]}x{new_res[1]}; using {cur_w}x{cur_h}")
+            req_w, req_h = cur_w, cur_h
+            failed_reads = 0
+            history["Left"].clear()
+            history["Right"].clear()
 
     cap.release()
     cv2.destroyAllWindows()
